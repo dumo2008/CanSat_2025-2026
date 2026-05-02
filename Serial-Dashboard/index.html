@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Live Sensor Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="chart.js"></script>
+
+  <style>
+    /* UI Styling */
+    .center-header { text-align:center; font-size:18px; font-weight:bold; margin:6px 0 10px 0; color:#d97706; }
+    .chart-header.temp { color: red !important; }
+    .chart-header.pres { color: blue !important; }
+    .chart-header.alt  { color: green !important; }
+    
+    .live-line { margin:6px 0; text-align:left; }
+    .live-label { color:#374151; }
+    .live-val { font-weight:700; }
+    
+    /* Value Colors */
+    .val-temp { color: red; }
+    .val-pres { color: blue; }
+    .val-alt  { color: green; }
+
+    #map { width: 100%; height: 100%; border-radius: 4px; z-index: 1; }
+
+    /* Custom style to make the Rocket Emoji look good on the map */
+    .rocket-icon {
+      font-size: 24px;
+      text-align: center;
+      line-height: 1;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>
+    Live Sensor Dashboard
+    <span class="status-indicator status-disconnected" id="statusIndicator"></span>
+  </h1>
+
+  <div class="dashboard-grid">
+    <div class="chart-box">
+      <div class="chart-header temp">Temperature (°C)</div>
+      <canvas id="tempChart"></canvas>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-header pres">Pressure (hPa)</div>
+      <canvas id="presChart"></canvas>
+    </div>
+
+    <div class="chart-box">
+      <div class="chart-header alt">Altitude (m)</div>
+      <canvas id="altChart"></canvas>
+    </div>
+
+    <div class="chart-box" id="extraBox1">
+      <div class="center-header">Motor &amp; AI</div>
+      <div class="live-line"><span class="live-label">Status: </span><span id="motorStatus" class="live-val">--</span></div>
+      <div class="live-line"><span class="live-label">TurnL: </span><span id="motorTurnL" class="live-val">--</span></div>
+      <div class="live-line"><span class="live-label">TurnR: </span><span id="motorTurnR" class="live-val">--</span></div>
+    </div>
+
+    <div class="gps-container">
+      <div class="center-header">Graph Data</div>
+      <div class="live-line"><span class="live-label">Temperature: </span><span id="liveTempVal" class="live-val val-temp">--</span></div>
+      <div class="live-line"><span class="live-label">Pressure: </span><span id="livePresVal" class="live-val val-pres">--</span></div>
+      <div class="live-line"><span class="live-label">Altitude (BM): </span><span id="liveAltVal" class="live-val val-alt">--</span></div>
+
+      <div class="center-header" style="margin-top:16px;">GPS</div>
+      <div class="live-line"><span class="live-label">Sats: </span><span id="gpsSats" class="live-val">--</span></div>
+      <div class="live-line"><span class="live-label">HDOP: </span><span id="gpsHdop" class="live-val">--</span></div>
+
+      <div class="gps-rows-wrap">
+        <div class="gps-row">
+          <div class="gps-label" style="color:#dc2626;">Target</div>
+          <div>Lat: <span id="targetLatDisplay">--</span></div>
+          <div>Lon: <span id="targetLonDisplay">--</span></div>
+          <div>Alt: <span id="targetAltDisplay">--</span> m</div>
+        </div>
+        <div class="gps-row live">
+          <div class="gps-label">Live</div>
+          <div>Lat: <span id="liveLat">--</span></div>
+          <div>Lon: <span id="liveLon">--</span></div>
+          <div>Alt: <span id="liveAlt">--</span> m</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-box" id="extraBox2">
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    /**
+     * 1. USER CONFIGURATION
+     * Change these values to set your destination.
+     */
+    const TARGET_LAT = 50.484059; 
+    const TARGET_LON = 6.183220;  
+    const TARGET_ALT = 562.0;
+
+    /**
+     * 2. CHART SYSTEM
+     * Handles the creation and live-updating of the line graphs.
+     */
+    const chartOptions = { 
+      type: 'line', 
+      options: { 
+        animation: false, 
+        responsive: true, 
+        maintainAspectRatio: false, 
+        scales: { x: { title: { display: true, text: "Time" } } }, 
+        plugins: { legend: { display: false } } 
+      } 
+    };
+
+    const tempChart = new Chart(document.getElementById('tempChart'), { ...chartOptions, data: { labels: [], datasets: [{ data: [], borderColor: 'red' }] } });
+    const presChart = new Chart(document.getElementById('presChart'), { ...chartOptions, data: { labels: [], datasets: [{ data: [], borderColor: 'blue' }] } });
+    const altChart  = new Chart(document.getElementById('altChart'),  { ...chartOptions, data: { labels: [], datasets: [{ data: [], borderColor: 'green' }] } });
+
+    // Helper: Formats current time for chart labels
+    function nowStr() { return new Date().toLocaleTimeString(); }
+
+    // Helper: Adds new data point and removes the oldest if list > 50
+    function updateChart(chart, value) {
+      chart.data.labels.push(nowStr());
+      chart.data.datasets[0].data.push(value);
+      if (chart.data.labels.length > 50) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+      chart.update('none');
+    }
+
+    /**
+     * 3. MAP & ICON SETUP
+     * Initializes Leaflet and custom markers.
+     */
+    const map = L.map('map').setView([TARGET_LAT, TARGET_LON], 16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { 
+      attribution: '&copy; OpenStreetMap' 
+    }).addTo(map);
+
+    // Custom Red Waypoint Icon
+    const redWaypointIcon = new L.Icon({
+      iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+      shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      popupAnchor: [1, -34],
+      shadowSize: [41, 41]
+    });
+
+    // Custom Rocket Icon (HTML-based emoji)
+    const rocketIcon = L.divIcon({
+      html: '<div class="rocket-icon">🚀</div>',
+      className: 'custom-div-icon', 
+      iconSize: [30, 30],
+      iconAnchor: [15, 15]
+    });
+
+    // Markers & Path
+    let liveMarker = L.marker([0, 0], { icon: rocketIcon }).addTo(map);
+    let pathLine   = L.polyline([], { color: '#ffdd57', weight: 3 }).addTo(map);
+
+    // Static Target Waypoint (Red Pin)
+    L.marker([TARGET_LAT, TARGET_LON], { icon: redWaypointIcon }).addTo(map)
+     .bindPopup(`Target Destination<br>Alt: ${TARGET_ALT}m`);
+
+    // Initialize UI Text with Target Values
+    document.getElementById("targetLatDisplay").textContent = TARGET_LAT.toFixed(6);
+    document.getElementById("targetLonDisplay").textContent = TARGET_LON.toFixed(6);
+    document.getElementById("targetAltDisplay").textContent = TARGET_ALT;
+
+    /**
+     * 4. DATA STREAMING
+     * Connects to the server and updates the dashboard in real-time.
+     */
+    const evt = new EventSource("/stream");
+    const statusDot = document.getElementById("statusIndicator");
+    
+    evt.onopen  = () => statusDot.className = "status-indicator status-connected";
+    evt.onerror = () => statusDot.className = "status-indicator status-disconnected";
+
+    evt.onmessage = (event) => {
+      let data; 
+      try { 
+        data = JSON.parse(event.data); 
+      } catch(err) { 
+        return; 
+      }
+
+      // Update Charts if data exists
+      if (!isNaN(data.temperature)) updateChart(tempChart, Number(data.temperature));
+      if (!isNaN(data.pressure))    updateChart(presChart, Number(data.pressure));
+      if (!isNaN(data.altitudeBM))  updateChart(altChart,  Number(data.altitudeBM));
+
+      // Update Dashboard Text
+      document.getElementById("liveTempVal").textContent = data.temperature ?? "--";
+      document.getElementById("livePresVal").textContent = data.pressure ?? "--";
+      document.getElementById("liveAltVal").textContent  = data.altitudeBM ?? "--";
+      document.getElementById("motorStatus").textContent  = data.status ?? "--";
+      document.getElementById("motorTurnL").textContent   = data.turnL ?? "--";
+      document.getElementById("motorTurnR").textContent   = data.turnR ?? "--";
+      document.getElementById("gpsSats").textContent      = data.sats ?? "--";
+      document.getElementById("gpsHdop").textContent      = data.hdop ?? "--";
+
+      // GPS Mapping Logic
+      const lat = parseFloat(data.lat);
+      const lon = parseFloat(data.lon);
+
+      if (!isNaN(lat) && !isNaN(lon)) {
+        const currentPos = [lat, lon];
+        
+        // Move the Rocket to current location
+        liveMarker.setLatLng(currentPos);
+        
+        // Draw the trail behind the rocket
+        pathLine.addLatLng(currentPos);
+        
+        // Center the camera on the rocket
+        map.panTo(currentPos);
+      }
+
+      // Update Live GPS UI text
+      document.getElementById("liveLat").textContent = isNaN(lat) ? "--" : lat.toFixed(6);
+      document.getElementById("liveLon").textContent = isNaN(lon) ? "--" : lon.toFixed(6);
+      document.getElementById("liveAlt").textContent = data.alt_gps ?? "--";
+    };
+  </script>
+</body>
+</html>
